@@ -1,0 +1,392 @@
+---
+title: "MMID Coding workshop RNAseq data analysis"
+author: "Jessy Slota"
+date: "9/3/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Part I: Processing raw read count files
+
+This tutorial will start with files that contain raw read counts for known transcripts mapping to the mouse genome. These files were previously generated using the Galaxy platform according to a standard RNAseq pre-processing workflow, that takes raw fastq files as input, and outputs these raw read count files. Each files corresponds to an individual sample that was sequenced.
+
+The first step is to merge all of the read count files into a single data-matrix and save this file for further analysis. A matrix containing corresponding sample information is also generated and saved.
+
+
+```{r raw read processing}
+###Collect all raw read count files and merge into one matrix
+data_files <- Sys.glob("raw read count files/*.tabular") #store paths for all raw read count files
+tmp <- list() #create an empty list to store each file
+for (i in data_files) {#for loop to load each individual read count file
+  X <- gsub(".tabular.*", "", gsub(".*raw read count files/", "", i)) #extract sample name from file name and store in "X"
+  tmp[[X]] <- read.delim(i, row.names = 1, header = FALSE) #load read count file "i"
+  colnames(tmp[[X]]) <- X #rename column with sample name
+  print(X) #print sample name to track progress in console
+}
+read_counts <- do.call(cbind, tmp) #do.call function collapses all objects within list into one data frame
+
+#Clean up read count file
+read_counts <- read_counts[rowMeans(read_counts)>0,] # remove all transcripts that were not detected
+read_counts <- read_counts[order(rowMeans(read_counts), decreasing = TRUE),] # order transcripts based on average raw read count
+
+#Save files for further analysis
+if (dir.exists("raw data") == FALSE) { dir.create("raw data") } 
+write.csv(read_counts, "raw data/raw_read_counts.csv")
+```
+
+# Part II: Normalizing raw read counts and assessing variation
+
+The next step is to normalize the raw read counts using DESeq2. DESeq2 is a popular r package for RNAseq data analysis. Another popular package is edgeR, but I prefer DESeq2.
+
+For a full description of DESeq2 and how to use it, refer to the vignette: http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#why-un-normalized-counts
+
+
+```{r read normalization}
+library(DESeq2)
+library(ggplot2)
+library(RColorBrewer)
+
+#load raw data
+read_counts <- read.csv("raw data/raw_read_counts.csv", row.names = 1)#load read count files
+sample_info <- read.csv("sample_info.csv", row.names = 2, stringsAsFactors = TRUE)[,-1]#load sample info and set rownames to sample name
+
+summary(colnames(read_counts)==rownames(sample_info))#make sure samples are in order
+
+#make DEseq data object
+dds <- DESeqDataSetFromMatrix(countData = read_counts, colData = sample_info, design = ~treatment+timepoint)
+dds <- DESeq(dds)
+```
+
+DESeq2 uses a "negative binomial generalized linear model of gene-fitted mean and dispersion estimates" to calculate statistics for differential expression analysis. In other words, it uses the raw read counts as input and models the read counts on the distribution of the entire dataset. 
+
+Another popular RNAseq R package, edgeR, uses as similar model and is supposed to produce very similar results. I personally prefer DESeq2 only because I have found it to be ever so slightly easier to use - you can perform the same analysis using slightly fewer lines of code.
+
+The model used by DESeq2 for normalization can be plotted as below using `plotDispEsts()`:
+
+```{r read normalization 2}
+#plot dispersion estimates to examine normalization
+plotDispEsts(dds)
+```
+
+You can also extract normalized read counts using the `vst()` function. Keep in mind that these normalized read counts are not used for differential testing - they are not meant to be used for statistical analysis, but they can be used for clustering/plotting/visualization etc.
+
+One example of this is principle component analysis (PCA). This is a useful way of plotting variation within the dataset in two dimensions. It can be used to assess inter-relatedness of samples and identify sources of variation within the data.
+
+DEseq2 has a built in function for PCA analysis: `plotPCA()`. The plot can also be customized with `ggplot()`.
+
+```{r read normalization 3}
+#Get normalized counts and make PCA plots
+norm_counts <- vst(dds)#extract normalized read counts
+plotPCA(norm_counts, intgroup=c("treatment", "timepoint"))#make a basic PCA plot
+
+#make a custom PCA plot with ggplot
+pcaData <- plotPCA(norm_counts, intgroup=c("treatment", "timepoint"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(PC1, PC2, color=timepoint, shape=treatment)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  scale_color_manual(values = brewer.pal(8, "Dark2")) +
+  coord_fixed() +
+  theme_classic()
+
+#Save normalized read counts for visualization later
+write.csv(assay(norm_counts), "raw data/normalized_read_counts.csv")
+```
+
+We can see that the RML samples at the terminal timepoint clustered separately from the rest of the dataset. Therefore, any differentially expressed genes identified in the RML samples at the terminal timepoint are highly likely to be related to RML infection.
+
+If you look closely, you can see that some of the Mock samples are also forming separate clusters. This tells us that variation within the dataset is being driven by factors outside of our treatment (RML infection), and this should be carefully considered when performing the differential expression analysis and interpreting the results.
+
+# Part III: differential expression analysis
+
+Next we will actually use DESeq2 for differential testing. Since the samples at 150 dpi clustering separately from the rest of the data, we will first focus on the 150 dpi samples.
+
+We will need to re normalize the data, this time using only the samples at 150 dpi and excluding the rest of the samples. In this particular case it makes sense to do this because we can see that there is high variation within the Mock samples, and they are forming separate clusters via PCA and this could influence the normalization. In other datasets, it may make sense to normalize all samples together - depending on how the experiment was designed and sources of variation within the dataset.
+
+We will use `DESeq()` to re-normalize the data and get the differential expression results with the `results()` function:
+
+``` {r differential expression}
+library(DESeq2)
+
+#load raw data
+read_counts <- read.csv("raw data/raw_read_counts.csv", row.names = 1)#load read count files
+sample_info <- read.csv("sample_info.csv", row.names = 2, stringsAsFactors = TRUE)[,-1]#load sample info and set rownames to sample name
+
+#Only keep samples from terminal timepoint
+samples <- rownames(sample_info[sample_info$timepoint=="terminal",])
+
+#make DEseq data object
+dds <- DESeqDataSetFromMatrix(countData = read_counts[,samples], colData = sample_info[samples,], design = ~treatment)
+dds <- DESeq(dds)
+
+#get differential expression results
+resultsNames(dds)
+res <- results(object = dds, contrast = c("treatment", "RML", "Mock"))#Contrast = RML vs Mock samples
+
+#clean up results file
+res <- res[order(res$padj),]
+res <- na.omit(res)
+res <-as.data.frame(res)
+
+summary(res$padj < 0.05)#Get summary of statistical significance
+
+#Save differential expression results
+if (dir.exists("DE results")==FALSE) { dir.create("DE results") }
+write.csv(res, "DE results/RML_terminal_DE_results.csv")
+```
+
+## Advanced
+
+If we want to test every group of samples at each timepoint (spanning from 4 wpi to terminal), we can do this with the following `for()` loop and save each as a separate results file in the `"DE results/"` directory:
+
+```{r differential expression 2}
+#Advanced - For loop that tests every comparison
+for (i in unique(sample_info$timepoint)) {
+  #get samples
+  samples <- rownames(sample_info[sample_info$timepoint==i,])
+  #make DEseq data object
+  dds <- DESeqDataSetFromMatrix(countData = read_counts[,samples], colData = sample_info[samples,], design = ~treatment)
+  dds <- DESeq(dds)
+  
+  #get differential expression results
+  resultsNames(dds)
+  res <- results(object = dds, contrast = c("treatment", "RML", "Mock"))
+  
+  #clean up results file
+  res <- res[order(res$padj),]
+  res <- na.omit(res)
+  res <-as.data.frame(res)
+  write.csv(res, paste0("DE results/RML_", i, "_DE_results.csv"))
+  print(paste0("saving file... ", "DE results/RML_", i, "_DE_results.csv"))
+}
+```
+
+# Part IV: Functional enrichment analysis
+
+Now that we have generated long lists of differentially expressed genes, we might ask ourselves "What type of genes are these?"
+
+We start by filtering genes on criteria to define those that reach statistical significance, in this case: `padj < 0.05, |log2FoldChange| > 0.85, baseMean > 15`
+
+We will separate the genes into those with increased and decreased abundance, and look for enriched gene sets with Enrichr.
+
+To take a quick look, one can test of list of genes in the Enrichr web browser (https://maayanlab.cloud/Enrichr/) by copying/pasting lists of genes. The `writeClipboard()` function automatically copies a list from R. We can explore every pathway database on the web browser, and decide on which databases we want to focus on for the analysis. For the purposes of this excercise, I chose the following databases: "WikiPathway_2021_Human", "GO_Cellular_Component_2021", "PanglaoDB_Augmented_2021"
+
+```{r enrichment anaylsis}
+library(enrichR)
+library(dplyr)
+
+#Identify DE genes
+res <- read.csv("DE results/RML_terminal_DE_results.csv")
+
+#Get some genes to test in enrichr
+res %>% filter(padj < 0.05, log2FoldChange > 0.85, baseMean > 15)%>% 
+  pull(X) %>% 
+  writeClipboard()#copies to clipboard... paste at https://maayanlab.cloud/Enrichr/
+
+#Make list of databases you are interested in
+dbs <- c("WikiPathway_2021_Human", "GO_Cellular_Component_2021", "PanglaoDB_Augmented_2021")
+
+#Genes with increased abundance
+genes <- res %>% filter(padj < 0.05, log2FoldChange > 0.85, baseMean > 15) %>% pull(X)
+
+#Run Enrichr
+enrch <- enrichr(genes, dbs)
+
+#convert results from list to data frame
+for (i in dbs) {
+  enrch[[i]]$database <- i
+}
+enrch <- do.call(rbind, enrch)
+```
+
+## Advanced
+
+We can also use a nested `for()` loop to get enrichment results from every combination of increased and decreased genes at each of the timepoints used for differential expression analysis. The full enrichment results are merged into a single file that is saved for further analysis/data visualization.
+
+``` {r enrichment analysis 2}
+###Advanced - for loop to get full enrichment results from every comparison
+#increased and decreased genes at 8 timepoints = 16 comparisons
+
+#Make list of databases you are interested in
+dbs <- c("WikiPathway_2021_Human", "GO_Cellular_Component_2021", "PanglaoDB_Augmented_2021")
+
+#Make empty list for full results
+full_enrch_results <- list()
+#Loop through every list of genes
+sample_info <- read.csv("sample_info.csv", row.names = 2)[,-1]
+for (i in unique(sample_info$timepoint)) {
+  res <- read.csv(paste0("DE results/RML_", i, "_DE_results.csv"))
+  
+  ##Genes with increased abundance
+  genes <- res %>% filter(padj < 0.05, log2FoldChange > 0.85, baseMean > 15) %>% pull(X)
+  if (length(genes) > 0) {
+    enrch <- enrichr(genes, dbs)
+    for (j in dbs) {
+      enrch[[j]]$timepoint <- i
+      enrch[[j]]$direction <- "up"
+      enrch[[j]]$database <- j
+    }
+    enrch <- do.call(rbind, enrch)#convert from list to data frame
+    full_enrch_results[[paste0(i, "_up")]] <- enrch
+    print(paste0("analysis complete... ", i, "_up"))
+  }
+  
+  ##Genes with increased abundance
+  genes <- res %>% filter(padj < 0.05, log2FoldChange < -0.85, baseMean > 15) %>% pull(X)
+  if (length(genes) > 0) {
+        enrch <- enrichr(genes, dbs)
+    for (j in dbs) {
+      enrch[[j]]$timepoint <- i
+      enrch[[j]]$direction <- "down"
+      enrch[[j]]$database <- j
+    }
+    enrch <- do.call(rbind, enrch)#convert from list to data frame
+    full_enrch_results[[paste0(i, "_down")]] <- enrch
+    print(paste0("analysis complete... ", i, "_down"))
+  }
+}
+full_enrch_results <- do.call(rbind, full_enrch_results)
+row.names(full_enrch_results) <- seq(1:nrow(full_enrch_results))
+
+#save final results for later
+if (dir.exists("Enrichr results")==FALSE) { dir.create("Enrichr results") }
+write.csv(full_enrch_results, "Enrichr results/full_enrichment_results.csv")
+```
+
+# Part V: Common data visualizations
+
+Now that we have completed a basic analysis, we can explore some common ways of visualizing the data to help us interpret the results. We have already seen an example of a PCA plot, which is a common data visualization technique that should be performed early in the analysis to help interpret the best approach for normalizing the data and differential expression analysis.
+
+```{r data viz}
+library(ggplot2)
+library(RColorBrewer)
+library(pheatmap)
+library(dplyr)
+```
+
+The first type of plot we will use is called a volcano plot: -log10(P-value) is plotted against log2(Fold Change). This is a common way of examining how many genes reach statistical significance:
+
+```{r data viz 2}
+#The volcano plot
+#Load differential expression results from terminal timepoint
+res <- read.csv("DE results/RML_terminal_DE_results.csv")
+
+#a basic volcano plot
+ggplot(res, aes(x=log2FoldChange, y=-log10(padj))) +
+  geom_point()
+
+#a nicer volcano plot
+ggplot(res, aes(x=log2FoldChange, y=-log10(padj), color=stat)) +
+  geom_point() +
+  geom_hline(yintercept = -log10(0.05), linetype="dashed", color="grey50") +
+  geom_vline(xintercept = 0.85, linetype="dashed", color="grey50") +
+  geom_vline(xintercept = -0.85, linetype="dashed", color="grey50") +
+  scale_color_gradient2(low = "navy", high = "firebrick", mid="grey95", midpoint = 0) +
+  theme_classic()
+```
+
+For our dataset, there were 8 comparisons and each would require it's own volcano plot. This would use up a lot of space in a figure, so it may be more efficient to simply plot the # of DE genes at each timepoint.
+
+```{r data viz 3}
+#Plotting number of DE genes at each timepoint
+res <- data.frame(timepoint=factor(c("4_wpi","4_wpi","8_wpi","8_wpi","12_wpi","12_wpi","14_wpi","14_wpi","16_wpi","16_wpi","18_wpi","18_wpi","20_wpi","20_wpi","terminal","terminal"),
+                                   levels = c("4_wpi","8_wpi","12_wpi","14_wpi","16_wpi","18_wpi","20_wpi","terminal")),
+                  direction=rep(c("up", "down"), 8),
+                  ngenes=NA)
+for (i in c("4_wpi","8_wpi","12_wpi","14_wpi","16_wpi","18_wpi","20_wpi","terminal")) {
+  tmp <- read.csv(paste0("DE results/RML_", i, "_DE_results.csv"))
+  res[res$timepoint==i&res$direction=="up",]$ngenes <- tmp %>% filter(padj < 0.05, log2FoldChange > 0.85, baseMean > 15) %>% NROW()
+  res[res$timepoint==i&res$direction=="down",]$ngenes <- tmp %>% filter(padj < 0.05, log2FoldChange < -0.85, baseMean > 15) %>% NROW()
+  rm(tmp)
+}
+
+#a basic plot
+ggplot(res, aes(x=timepoint, y=ngenes, color=direction, shape=direction)) +
+  geom_point()
+
+#a nicer plot
+ggplot(res, aes(x=timepoint, y=ngenes, color=direction, shape=direction, label=ngenes)) +
+  geom_point() +
+  geom_text(nudge_y = 50) +
+  scale_color_manual(values=c("navy", "firebrick")) +
+  theme_classic()
+```
+
+Another popular type of visualization is a hierarchical clustered heatmap. This lets us examine the relative abundance of genes across all samples in the dataset. In this case we will look at the differentially expressed genes at 150 dpi and we will visualize relative abundance as Z-scores:
+
+We will calculate Z-scores for each gene using the normalized read counts that we saved back in Part II. Remember, these type of normalized read counts are not meant for making statistical comparisons, but they are useful for visualizations.
+
+I prefer using `pheatmap()` for heatmaps, as it plots dendrograms along with the heatmap. It is also possible to make heatmaps in `ggplot()`.
+
+```{r data viz 4}
+#The heatmap
+#We will use DE genes at terminal timepoint
+genes <- read.csv("DE results/RML_terminal_DE_results.csv") %>%  filter(padj < 0.05, abs(log2FoldChange) > 0.85, baseMean > 15) %>% pull(X)
+
+#We will use normalized read-counts to calculate z-scores
+zscores <- read.csv("raw data/normalized_read_counts.csv", row.names = 1)
+zscores <- as.matrix(zscores[genes,])
+zscores <- (zscores-rowMeans(zscores))/matrixStats::rowSds(zscores)
+
+#basic heatmap with hierarchical clustering
+pheatmap(zscores)
+
+#nicer heatmap
+#specify additional variables required by pheatmap
+plot_colors <- rev(colorRampPalette(brewer.pal(11,"PuOr"))(100))#colors for mapping to z-scores
+column_annotation <- read.csv("sample_info.csv", row.names = 2)[,-1]#annotation for samples
+cls <- brewer.pal(8, "Dark2")#colors for qualitative categorization of samples
+annotation_colors <- list(`treatment`=c(`RML`="firebrick", `Mock`="navy"),#this list sets the colors for the annotation
+                          `timepoint`=c(`4_wpi`=cls[1],`8_wpi`=cls[2],`12_wpi`=cls[3],`14_wpi`=cls[4],
+                                        `16_wpi`=cls[5],`18_wpi`=cls[6],`20_wpi`=cls[7],`terminal`=cls[8]))
+
+pheatmap(zscores, color = plot_colors, annotation_col = column_annotation, annotation_colors = annotation_colors,
+         show_rownames = FALSE, show_colnames = FALSE, treeheight_row = 25, treeheight_col = 25)
+```
+
+Finally, we will also plot the enrichment results from part IV. There are many different ways of plotting these results - one can even simply leave them as a table.
+
+Below is one type of plot I use to rank the enriched pathways by P-value. To illustrate the results, here we will plot the top 10 Wiki-pathways enriched with increased genes at 150 dpi and top 10 cellular components enriched with decreased genes at 150 dpi.
+
+```{r data viz 5}
+#Plotting the enrichment results
+erch <- read.csv("Enrichr results/full_enrichment_results.csv") #load full enrichment results
+res <- erch %>% #filter to top 10 enriched WikiPathways increased at terminal timepoint
+  filter(timepoint=="terminal", direction=="up", database == "WikiPathway_2021_Human") %>% 
+  arrange(Adjusted.P.value) %>% 
+  dplyr::slice(1:10)
+
+#basic enrichment plot
+ggplot(res, aes(x=-log10(Adjusted.P.value), y=Term)) +
+  geom_point()
+
+#nicer plot
+#order Terms based on P-value by converting to a factor
+res$Term <- factor(res$Term, levels = res$Term)
+ggplot(res, aes(x=-log10(Adjusted.P.value), y=Term, color=Combined.Score, label=Overlap)) +
+  geom_point(size=3, alpha=0.5) +
+  geom_text(nudge_x = 0.5, hjust=0) +
+  scale_color_gradientn(colors=brewer.pal(8, "Oranges")[3:8]) +
+  theme_classic()
+
+#Next make a plot for decreased genes at terminal timepoint
+res <- erch %>% #filter to top 10 enriched cellular components decreased at terminal timepoint
+  filter(timepoint=="terminal", direction=="down", database == "GO_Cellular_Component_2021") %>% 
+  arrange(Adjusted.P.value) %>% 
+  dplyr::slice(1:10) 
+res$Term <- factor(res$Term, levels = res$Term)
+
+ggplot(res, aes(x=-log10(Adjusted.P.value), y=Term, color=Combined.Score, label=Overlap)) +
+  geom_point(size=3, alpha=0.5) +
+  geom_text(nudge_x = 0.5, hjust=0) +
+  scale_color_gradientn(colors=brewer.pal(8, "Purples")[3:8]) +
+  theme_classic()
+```
+
+This covers many of the basic steps for RNAseq data analysis! The most important thing to keep in mind is that every dataset is different... some of the tricks used in this tutorial might not be directly applicable to your own datasets.
+
+The best advice I can give overall is to be your own "toughest critic" when scrutinizing the quality of your data. There will almost always be sources of biological and technical variation that can influence your results.
